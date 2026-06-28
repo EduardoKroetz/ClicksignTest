@@ -1,40 +1,58 @@
+using System.ComponentModel.DataAnnotations;
 using System.Net.Http.Headers;
 using System.Text.Json.Serialization;
 
 var builder = WebApplication.CreateBuilder(args);
 
+const string clicksignAccessToken = "SEU_ACCESS_TOKEN";
+
+#region Configure Services
+
+builder.Services.AddValidation();
+
 builder.Services.AddHttpClient<ClicksignClient>(client =>
 {
     client.BaseAddress = new Uri("https://sandbox.clicksign.com/api/v3/");
-    client.DefaultRequestHeaders.Add("Authorization", "SEU_ACCESS_TOKEN_SANDBOX");
+    client.DefaultRequestHeaders.Add("Authorization", clicksignAccessToken);
     client.DefaultRequestHeaders.Accept.Add(new MediaTypeWithQualityHeaderValue("application/vnd.api+json"));
 });
+
+#endregion
 
 var app = builder.Build();
 
 app.UseHttpsRedirection();
 
-app.MapPost("/EnviarParaAssinatura", async (EnviarParaAssinaturaRequest input, ClicksignClient clicksign) =>
+app.MapPost("/signature-requests", async (SendForSignatureRequest request, ClicksignClient clicksign) =>
 {
-    var envelopeId = await clicksign.PostAsync("envelopes", new CreateEnvelopeRequest(input.Name));
+    // 1. Cria o envelope — a "caixa" que guarda documentos, signatários e status
+    var envelopeId = await clicksign.PostAsync("envelopes", new CreateEnvelopeRequest(request.Name));
 
-    var documentId = await clicksign.PostAsync($"envelopes/{envelopeId}/documents", new CreateDocumentRequest(input.FileName, input.ContentBase64));
+    // 2. Anexa o documento que será assinado (PDF em base64)
+    var documentId = await clicksign.PostAsync($"envelopes/{envelopeId}/documents",
+        new CreateDocumentRequest(request.Name, request.DocumentBase64));
 
-    var signerId = await clicksign.PostAsync($"envelopes/{envelopeId}/signers", new CreateSignerRequest(input.SignerName, input.SignerEmail));
+    // 3. Adiciona o signatário - quem assina o documento
+    var signerId = await clicksign.PostAsync($"envelopes/{envelopeId}/signers",
+        new CreateSignerRequest(request.SignerName, request.SignerEmail));
 
-    await clicksign.PostAsync($"envelopes/{envelopeId}/requirements", new CreateAuthRequirementRequest(documentId, signerId, auth: "email"));
+    // 4. Requisito de autenticação — como o signatário prova identidade (token por e-mail)
+    await clicksign.PostAsync($"envelopes/{envelopeId}/requirements",
+        new CreateAuthRequirementRequest(documentId, signerId, auth: "email"));
 
-    await clicksign.PostAsync($"envelopes/{envelopeId}/requirements", new CreateQualificationRequirementRequest(documentId, signerId, role: "party"));
+    // 5. Requisito de qualificação — o que o signatário faz: assinar o documento
+    await clicksign.PostAsync($"envelopes/{envelopeId}/requirements",
+        new CreateQualificationRequirementRequest(documentId, signerId, role: "sign"));
 
-    await clicksign.PatchAsync($"envelopes/{envelopeId}", new ActivateEnvelopeRequest(envelopeId, status: "running"));
+    // 6. Ativa o envelope (draft -> running)
+    await clicksign.PatchAsync($"envelopes/{envelopeId}",
+        new ActivateEnvelopeRequest(envelopeId, status: "running"));
 
-    return Results.Ok(new
-    {
-        envelopeId,
-        documentId,
-        signerId,
-        status = "running"
-    });
+    // 7. Notifica o signatário por e-mail
+    await clicksign.PostAsync($"envelopes/{envelopeId}/notifications",
+        new EnvelopeNotificationRequest());
+
+    return Results.Ok(new { envelopeId, documentId, signerId, status = "running" });
 });
 
 app.Run();
@@ -74,12 +92,18 @@ public class ClicksignClient
 
 #region DTOs
 
-public class EnviarParaAssinaturaRequest
+public class SendForSignatureRequest
 {
+    [Required]
     public required string Name { get; set; }
-    public required string FileName { get; set; }
-    public required string ContentBase64 { get; set; }
+
+    [Required]
+    public required string DocumentBase64 { get; set; }
+
+    [Required()]
     public required string SignerName { get; set; }
+
+    [Required]
     public required string SignerEmail { get; set; }
 }
 
@@ -125,6 +149,12 @@ public class CreateEnvelopeRequest
     {
         [JsonPropertyName("name")]
         public string Name { get; set; }
+
+        [JsonPropertyName("deadline_at")]
+        public DateTime DeadlineAt { get; set; } = DateTime.UtcNow.AddDays(30);
+
+        [JsonPropertyName("auto_close")]
+        public bool AutoClose { get; set; } = true;
     }
 }
 
@@ -172,11 +202,27 @@ public class CreateDocumentRequest
         {
             Attributes = new()
             {
-                Filename = fileName,
-                ContentBase64 = contentBase64
+                // Formatação dentro do DTO para simplificar o exemplo
+                Filename = FormatFileName(fileName),
+                ContentBase64 = FormatBase64(contentBase64)
             }
         };
     }
+
+    private static string FormatFileName(string fileName)
+    {
+        return fileName.EndsWith(".pdf", StringComparison.OrdinalIgnoreCase)
+            ? fileName
+            : $"{fileName}.pdf";
+    }
+
+    private static string FormatBase64(string contentBase64)
+    {
+        return contentBase64.StartsWith("data:", StringComparison.OrdinalIgnoreCase)
+            ? contentBase64
+            : $"data:application/pdf;base64,{contentBase64}";
+    }
+
 
     [JsonPropertyName("data")]
     public DocumentData Data { get; set; }
@@ -337,7 +383,37 @@ public class CreateQualificationRequirementRequest
         public string Action { get; set; } = "agree";
 
         [JsonPropertyName("role")]
-        public string Role { get; set; } // sign | party | contractor
+        public string Role { get; set; } // sign | party | contractor, etc
+    }
+}
+
+public class EnvelopeNotificationRequest
+{
+    public EnvelopeNotificationRequest()
+    {
+        Data = new()
+        {
+            Attributes = new()
+        };
+    }
+
+
+    [JsonPropertyName("data")]
+    public EnvelopeNotificationData Data { get; set; }
+
+    public class EnvelopeNotificationData
+    {
+        [JsonPropertyName("type")]
+        public string Type { get; set; } = "notifications";
+
+        [JsonPropertyName("attributes")]
+        public EnvelopeNotificationAttributes Attributes { get; set; }
+    }
+
+    public class EnvelopeNotificationAttributes
+    {
+        [JsonPropertyName("message")]
+        public string Message { get; set; }
     }
 }
 
